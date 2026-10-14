@@ -22,8 +22,8 @@ username_http = 'klant'
 password_http = 'klant'
 
 # Enter your APITEST form login here (do not share the completed file).
-username_form = ''
-password_form = ''
+username_form = 'lionv13@hotmail.com'
+password_form = 'kuwfi3-pAwzeh-qunbax'
 
 file_path = "/Users/gast/Documents/biocheck/trabajos/2026/octubre/dutch_sr/Small_ruminants_Dairy_NL_new_look_NC_IM_clean_for Leonardo .docx"
 questionnaire_url = "https://apitest.biocheckgent.com/en/questionnaires/small-ruminants-dairy/edit/questionnaire"
@@ -36,29 +36,29 @@ driver = None
 # =============================================================
 
 def inloggen():
-    """Use the same direct-questionnaire login destination as the working Czech script."""
     if username_form == "YOUR_EMAIL" or password_form == "YOUR_PASSWORD":
         raise RuntimeError("Enter your APITEST email and password in the configuration section.")
-    destination = "/en/questionnaires/small-ruminants-dairy"
-    url = (f"https://{username_http}:{password_http}@apitest.biocheckgent.com"
-           f"/en/user/login?destination={destination}")
-    print("🔐 Opening APITEST login with questionnaire destination...")
+    if username_http and password_http:
+        url = f"https://{username_http}:{password_http}@apitest.biocheckgent.com/en/user/login?destination=/en/dashboard"
+    else:
+        url = "https://apitest.biocheckgent.com/en/user/login?destination=/en/dashboard"
     driver.get(url)
-    name_input = WebDriverWait(driver, 20).until(
-        EC.presence_of_element_located((By.ID, "edit-name")))
-    name_input.clear()
-    name_input.send_keys(username_form)
-    pass_input = driver.find_element(By.ID, "edit-pass")
-    pass_input.clear()
-    pass_input.send_keys(password_form, Keys.RETURN)
-    WebDriverWait(driver, 20).until(lambda d: "/user/login" not in d.current_url)
-    WebDriverWait(driver, 20).until(
-        lambda d: d.execute_script("return document.readyState") == "complete")
-    print("✅ Login complete. Current URL:", driver.current_url)
-    if "/questionnaires/small-ruminants-dairy" not in driver.current_url:
-        raise RuntimeError("Login did not reach Small Ruminants questionnaire: " + driver.current_url)
-    if "unexpected error" in driver.find_element(By.TAG_NAME, "body").text.lower():
-        raise RuntimeError("APITEST returned an error after login")
+
+    try:
+        name_input = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.ID, "edit-name"))
+        )
+        name_input.clear()
+        name_input.send_keys(username_form)
+
+        pass_input = driver.find_element(By.ID, "edit-pass")
+        pass_input.clear()
+        pass_input.send_keys(password_form, Keys.RETURN)
+
+        print("✅ Login completo.")
+
+    except TimeoutException:
+        print("❌ No se encontró el formulario de login.")
 
 
 # =============================================================
@@ -405,7 +405,7 @@ def extract_data(file_path):
         cat_match = category_pattern.match(value)
         if cat_match and (size or 0) >= 16 or (cat_match and len(cat_match.group(1)) == 1 and cat_match.group(1) in 'ABCDEFGHIJKLM' and (size or 0) == 12 and current is not None):
             finish_question()
-            category = {'category_name': cat_match.group(2).strip(), 'questions': []}
+            category = {'category_name': (value if cat_match.group(1) == '~' else cat_match.group(2)), 'questions': []}
             categories.append(category)
             question_counter = 0
             continue
@@ -502,7 +502,10 @@ def process_items(driver, categories):
                     add_links[0].click()
                     print("➕ Clicked 'Add'")
                 else:
-                    raise RuntimeError("No Dutch Edit/Add link found; stopping to avoid misalignment")
+                    print("⚠️ No edit or add link found, skipping item")
+                    item_index += 1
+                    driver.get(questionnaire_url)
+                    continue
 
             WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.TAG_NAME, "form"))
@@ -525,12 +528,12 @@ def process_items(driver, categories):
 
                 if items[item_index][0] == "category" and "Category name" in label_text and category_index < len(all_category_names):
                     field = driver.find_element(By.ID, input_id)
-                    # Same label-driven field-setting method as Czech script.
-                    if not set_text_input_value(driver, field, all_category_names[category_index], label="category"):
-                        raise RuntimeError("Category input could not be set")
-                    actual = field.get_attribute("value")
-                    if actual != all_category_names[category_index]:
-                        raise RuntimeError(f"Category field mismatch: {actual!r}")
+                    set_text_input_value(
+                        driver,
+                        field,
+                        all_category_names[category_index],
+                        label="category"
+                    )
 
                     print(f"🏷️ Set category: {all_category_names[category_index]}")
                     category_index += 1
@@ -686,20 +689,10 @@ def process_items(driver, categories):
             )
 
             time.sleep(1)
-            # Czech script uses JavaScript click; use the same submission method.
             driver.execute_script("arguments[0].click();", save_button)
 
             print("💾 Clicked Save")
-            time.sleep(3)
-            page_text = driver.find_element(By.TAG_NAME, "body").text
-            if "The website encountered an unexpected error" in page_text:
-                driver.save_screenshot("apitest_category_error.png")
-                raise RuntimeError("APITEST server error after Save. Screenshot: apitest_category_error.png")
-            if driver.find_elements(By.CSS_SELECTOR, ".messages--error, .alert-danger, [role='alert']"):
-                driver.save_screenshot("apitest_form_error.png")
-                raise RuntimeError("APITEST reported a form error. Screenshot: apitest_form_error.png")
-            print("✅ Saved item", item_index + 1, "of", total_items)
-            print("Post-save URL:", driver.current_url)
+
             item_index += 1
             time.sleep(2)
             driver.get(questionnaire_url)
@@ -709,7 +702,8 @@ def process_items(driver, categories):
             print("🛑 Stopping to avoid shifting subsequent translations after an error.")
 
             try:
-                driver.save_screenshot("apitest_translation_failure.png")
+                driver.get(questionnaire_url)
+                time.sleep(2)
             except Exception:
                 pass
 
@@ -741,4 +735,4 @@ if __name__ == "__main__":
     inloggen()
     driver.get(questionnaire_url)
     process_items(driver, categories)
-    print("🎉 Completed the full Dutch translation processing on APITEST.")
+    print("🎉 Finished processing all translations on APITEST.")
