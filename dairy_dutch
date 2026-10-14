@@ -22,8 +22,8 @@ username_http = 'klant'
 password_http = 'klant'
 
 # Enter your APITEST form login here (do not share the completed file).
-username_form = 'lionv13@hotmail.com'
-password_form = 'kuwfi3-pAwzeh-qunbax'
+username_form = ''
+password_form = ''
 
 file_path = "/Users/gast/Documents/biocheck/trabajos/2026/octubre/dutch_sr/Small_ruminants_Dairy_NL_new_look_NC_IM_clean_for Leonardo .docx"
 questionnaire_url = "https://apitest.biocheckgent.com/en/questionnaires/small-ruminants-dairy/edit/questionnaire"
