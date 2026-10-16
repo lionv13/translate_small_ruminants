@@ -1,0 +1,700 @@
+from selenium import webdriver
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
+import docx
+from docx.table import Table
+import time
+import re
+import json
+from pathlib import Path
+import os
+from html import escape
+
+
+##=============================================================
+# ------------------ Login - REAL / PRODUCTION -----------------
+# =============================================================
+file_path = "/Users/gast/Documents/biocheck/trabajos/2026/octubre/dutch_sr/Small_ruminants_Meat_NL_new_look_ NC_IM_clean for Leonardo.docx"
+questionnaire_url = "https://biocheckgent.com/en/questionnaires/small-ruminants-meat/edit/questionnaire"
+
+driver = None
+
+def credentials():
+    username = ''
+    password = ''
+
+    name_input = WebDriverWait(driver, 20).until(
+        EC.presence_of_element_located((By.ID, "edit-name"))
+    )
+    pass_input = WebDriverWait(driver, 20).until(
+        EC.presence_of_element_located((By.ID, "edit-pass"))
+    )
+
+    name_input.clear()
+    name_input.send_keys(username)
+
+    pass_input.clear()
+    pass_input.send_keys(password)
+    pass_input.send_keys(Keys.RETURN)
+
+
+def inloggen():
+    login_url = 'https://biocheckgent.com/en/user/login?destination=/en/dashboard'
+
+    print("Opening REAL Biocheck login...")
+    driver.get(login_url)
+
+    credentials()
+
+    try:
+        WebDriverWait(driver, 20).until(
+            lambda d: "/user/login" not in d.current_url
+        )
+        print("Login successful.")
+        print("Current URL:", driver.current_url)
+    except TimeoutException:
+        print("Login did not leave the login page.")
+        print("Current URL:", driver.current_url)
+        raise
+
+
+# =============================================================
+# ------------------ Text helpers -----------------------------
+# =============================================================
+
+def is_instruction_text(text):
+    if not text:
+        return True
+
+    cleaned = text.strip()
+
+    skip_texts = {
+        "Selecione uma opção",
+        "Selecione uma opção.",
+        "Marque todas as opções aplicáveis",
+        "Marque todas as opções aplicáveis.",
+        "Mark all applicable options",
+        "Mark all applicable options.",
+        "Select one option",
+        "Select one option.",
+        "Check any that apply",
+        "Check any that apply."
+    }
+
+    return cleaned in skip_texts
+
+
+def is_checkbox_instruction_question(question_text):
+    if not question_text:
+        return False
+
+    cleaned = question_text.strip().lower()
+
+    return cleaned in {
+        "marque todas as opções aplicáveis",
+        "marque todas as opções aplicáveis.",
+        "check any that apply",
+        "check any that apply."
+    }
+
+
+def clean_question_text(question_text):
+    return re.sub(
+        r'^(\d+[a-zA-Z]?|[IVXLCDM]+)\.\s*',
+        '',
+        question_text or ''
+    ).strip()
+
+
+def set_text_input_value(driver, field, value, label="field"):
+    """Set a normal text input reliably, even when Selenium clear()/send_keys() fails."""
+    value = str(value or "")
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", field)
+        driver.execute_script(
+            """
+            const el = arguments[0];
+            const value = arguments[1];
+            el.focus();
+            el.value = value;
+            el.setAttribute('value', value);
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            el.blur();
+            """,
+            field,
+            value
+        )
+        print(f"✅ Set {label}: {value}")
+        return True
+    except Exception as e:
+        print(f"⚠️ Could not set {label}: {e}")
+        return False
+
+
+# =============================================================
+# ------------------ CKEditor Helper --------------------------
+# =============================================================
+
+def fill_ckeditor5_field(driver, field_id, text, label="", timeout=10):
+    try:
+        editor_div = WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, f"#{field_id} + div.ck-editor div.ck-editor__editable")
+            )
+        )
+
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", editor_div)
+        driver.execute_script("arguments[0].focus();", editor_div)
+
+        escaped_text = json.dumps(text or "")
+
+        success = driver.execute_script(f"""
+            let textarea = document.getElementById("{field_id}");
+            if (!textarea) return false;
+
+            let wrapper = textarea.closest(".form-item");
+            if (!wrapper) return false;
+
+            let editable = wrapper.querySelector("div.ck-editor__editable");
+            if (!editable) return false;
+
+            let editorInstance =
+                editable.ckeditorInstance ||
+                editable._ckeditorInstance ||
+                editable._ckeditor5_instance;
+
+            if (editorInstance) {{
+                editorInstance.setData({escaped_text});
+                return true;
+            }}
+
+            editable.innerHTML = {escaped_text};
+            editable.dispatchEvent(new Event("input", {{ bubbles: true }}));
+            editable.dispatchEvent(new Event("change", {{ bubbles: true }}));
+            return true;
+        """)
+
+        if success:
+            print(f"✅ Successfully set '{label}'.")
+        else:
+            print(f"⚠️ Could not set CKEditor field '{label}'.")
+
+    except Exception as e:
+        print(f"⚠️ CKEditor failed for '{label}': {e}")
+
+
+# =============================================================
+# ------------------ Question identifier ----------------------
+# =============================================================
+
+def fill_question_identifier(driver, question_number):
+    """
+    Fill 'Question identifier (all languages)' with the Word question number.
+    This is only called for checkbox instruction questions such as 7b, 8b, 10b.
+
+    Uses JavaScript because this field can be required/managed by Drupal and
+    sometimes Selenium clear()/send_keys() fails even when the element exists.
+    """
+    if not question_number:
+        print("⚠️ No question number available for identifier.")
+        return
+
+    try:
+        # Preferred selector from the HTML:
+        # <input id="edit-identifier-0-value" name="identifier[0][value]" ...>
+        field = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.ID, "edit-identifier-0-value"))
+        )
+
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});",
+            field
+        )
+
+        value = str(question_number)
+
+        # JS is more reliable than field.clear()/send_keys() for Drupal fields.
+        driver.execute_script(
+            """
+            const el = arguments[0];
+            const value = arguments[1];
+            el.focus();
+            el.value = value;
+            el.setAttribute('value', value);
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            el.blur();
+            """,
+            field,
+            value
+        )
+
+        print(f"🔢 Set question identifier: {question_number}")
+
+    except Exception as e:
+        print(f"⚠️ Could not set question identifier {question_number}: {e}")
+
+# =============================================================
+# ------------------ Matrix Question Helper -------------------
+# =============================================================
+
+def fill_matrix_question(driver, question_data):
+    try:
+        try:
+            select_elem = WebDriverWait(driver, 3).until(
+                EC.presence_of_element_located((By.ID, "edit-type"))
+            )
+            select = Select(select_elem)
+
+            current_value = select.first_selected_option.text.strip().lower()
+
+            if "matrix" not in current_value:
+                select.select_by_visible_text("Matrix")
+                print("✅ Set question type to Matrix")
+
+        except TimeoutException:
+            print("ℹ️ Matrix type selector not found, assuming already set.")
+
+        WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, '#edit-field-options-0-value')
+            )
+        )
+
+        print("✅ Matrix inputs loaded.")
+
+    except Exception as e:
+        print(f"⚠️ Matrix structure not found: {e}")
+        return
+
+    for i, option in enumerate(question_data.get("answers", [])):
+        try:
+            option_input = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located(
+                    (By.ID, f'edit-field-options-{i}-value')
+                )
+            )
+            set_text_input_value(
+                driver,
+                option_input,
+                option,
+                label=f"matrix option {i + 1}"
+            )
+            print(f"✅ Set matrix option {i + 1}: {option}")
+
+        except Exception as e:
+            print(f"⚠️ Could not set matrix option {i + 1}: {e}")
+
+    for j, statement in enumerate(question_data.get("statements", [])):
+        try:
+            statement_input = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located(
+                    (By.ID, f'edit-field-statements-{j}-value')
+                )
+            )
+            set_text_input_value(
+                driver,
+                statement_input,
+                statement,
+                label=f"statement {j + 1}"
+            )
+            print(f"✅ Set statement {j + 1}: {statement}")
+
+        except Exception as e:
+            print(f"⚠️ Could not set statement {j + 1}: {e}")
+
+
+# =============================================================
+# ------------------ Extract Data from Word -------------------
+# =============================================================
+
+def extract_data(file_path):
+    """Read the Dutch Word survey, including Word auto-numbered question 1."""
+    doc = docx.Document(file_path)
+    blocks = []
+    for element in doc.element.body:
+        if element.tag.endswith('}p'):
+            blocks.append(docx.text.paragraph.Paragraph(element, doc))
+        elif element.tag.endswith('}tbl'):
+            blocks.append(Table(element, doc))
+
+    categories = []
+    category = None
+    current = None
+    question_counter = 0
+    category_pattern = re.compile(r'^(~|[A-M])\.\s*(.+)$')
+    numbered_pattern = re.compile(r'^(\d+[a-zA-Z]?|[IVXLCDM]+)\.\s*(.+)$')
+    bullet_pattern = re.compile(r'^[□○●•▪]\s*')
+    instruction_pattern = re.compile(r'^(?:Selecteer één optie|Kruis aan wat van toepassing is)\.?$', re.I)
+    redirect_pattern = re.compile(r'\b(?:ga naar|ga rechtstreeks naar|sla .* over|indien .* gekozen wordt|als .* gekozen wordt)\b', re.I)
+    placeholder_pattern = re.compile(r'^[.\s…_\-]+$')
+
+    def finish_question():
+        nonlocal current
+        if current is not None and category is not None:
+            for key in ('help_text', 'redirect'):
+                current[key] = ' '.join(current[key]).strip()
+            category['questions'].append(current)
+        current = None
+
+    for block in blocks:
+        if isinstance(block, Table):
+            if current is None:
+                continue
+            rows = [[cell.text.strip() for cell in row.cells] for row in block.rows]
+            if rows:
+                current['answers'] = [c for c in rows[0][1:] if c]
+                current['statements'] = [row[0] for row in rows[1:] if row and row[0]]
+            continue
+
+        value = re.sub(r'\s+', ' ', block.text).strip()
+        if not value:
+            continue
+        value = re.sub(r'\s*\(verplicht\)', '', value, flags=re.I).strip()
+        size = max((r.font.size.pt for r in block.runs if r.font.size), default=None)
+        cat_match = category_pattern.match(value)
+        if cat_match and (size or 0) >= 16:
+            finish_question()
+            category = {'category_name': cat_match.group(2).strip(), 'questions': []}
+            categories.append(category)
+            question_counter = 0
+            continue
+
+        match = numbered_pattern.match(value)
+        is_word_numbered = (block.style.name.startswith('List') and (size or 0) >= 14 and not bullet_pattern.match(value))
+        is_question = category is not None and ((match and (size or 0) >= 14) or is_word_numbered)
+        if is_question:
+            finish_question()
+            question_counter += 1
+            number = match.group(1) if match else str(question_counter)
+            qtext = match.group(2) if match else value
+            current = {'question': qtext, 'number': number, 'answers': [], 'statements': [], 'help_text': [], 'redirect': []}
+            continue
+        if current is None or instruction_pattern.match(value) or placeholder_pattern.match(value):
+            continue
+        if bullet_pattern.match(value):
+            answer = bullet_pattern.sub('', value).strip()
+            if answer:
+                current['answers'].append(answer)
+            continue
+        if redirect_pattern.search(value):
+            current['redirect'].append(value)
+        else:
+            current['help_text'].append(value)
+
+    finish_question()
+    return categories
+
+
+# =============================================================
+# ------------------ Process Items ----------------------------
+# =============================================================
+
+def process_items(driver, categories):
+    if not questionnaire_url.startswith("https://biocheckgent.com/en/questionnaires/small-ruminants-meat/"):
+        raise RuntimeError("Only the APITEST small-ruminants-meat questionnaire is allowed.")
+    print("🔧 Starting to process items...")
+
+    items = [item for cat in categories for item in [("category", cat["category_name"])] + [("question", q) for q in cat["questions"]]]
+    all_category_names = [v for kind, v in items if kind == "category"]
+    all_questions = [v for kind, v in items if kind == "question"]
+
+    item_index = 0
+    question_index = 0
+    category_index = 0
+
+    total_items = len(all_category_names) + len(all_questions)
+
+    while item_index < total_items:
+        try:
+            print(f"\n🔍 Processing item {item_index + 1}...")
+
+            translate_link = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable(
+                    (
+                        By.XPATH,
+                        f"(//tr[td]//a[text()='Translate'])[{item_index + 1}]"
+                    )
+                )
+            )
+
+            try:
+                translate_link.click()
+            except StaleElementReferenceException:
+                translate_link = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable(
+                        (
+                            By.XPATH,
+                            f"(//tr[td]//a[text()='Translate'])[{item_index + 1}]"
+                        )
+                    )
+                )
+                translate_link.click()
+
+            row = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located(
+                    (
+                        By.XPATH,
+                        "//tr[td//text()[contains(., 'Dutch')]]"
+                    )
+                )
+            )
+
+            edit_links = row.find_elements(By.XPATH, ".//a[contains(@href, '/edit')]")
+
+            if edit_links:
+                edit_links[0].click()
+                print("✏️ Clicked 'Edit'")
+            else:
+                add_links = row.find_elements(By.XPATH, ".//a[contains(@href, '/add')]")
+
+                if add_links:
+                    add_links[0].click()
+                    print("➕ Clicked 'Add'")
+                else:
+                    raise RuntimeError("No Dutch Edit/Add link found; stopping to avoid misalignment")
+
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, "form"))
+            )
+
+            labels = driver.find_elements(By.XPATH, "//label")
+
+            # Each edit/add page corresponds to ONE item only: either one category
+            # or one question. After filling that item, break out of the label loop
+            # so the script does not accidentally consume the next Word question
+            # on the same page before clicking Save.
+            item_filled = False
+
+            for label in labels:
+                label_text = label.text.strip()
+                input_id = label.get_attribute("for")
+
+                if not input_id:
+                    continue
+
+                if items[item_index][0] == "category" and "Category name" in label_text and category_index < len(all_category_names):
+                    field = driver.find_element(By.ID, input_id)
+                    # Same label-driven field-setting method as Czech script.
+                    if not set_text_input_value(driver, field, all_category_names[category_index], label="category"):
+                        raise RuntimeError("Category input could not be set")
+                    actual = field.get_attribute("value")
+                    if actual != all_category_names[category_index]:
+                        raise RuntimeError(f"Category field mismatch: {actual!r}")
+
+                    print(f"🏷️ Set category: {all_category_names[category_index]}")
+                    category_index += 1
+                    item_filled = True
+                    break
+
+                label_text_lower = label_text.lower()
+
+                # IMPORTANT: Do not treat "Question identifier (all languages)" as the
+                # translatable Question field. It is a separate field.
+                is_main_question_field = (
+                    "question" in label_text_lower
+                    and "identifier" not in label_text_lower
+                    and "sequence" not in label_text_lower
+                )
+
+                if items[item_index][0] == "question" and is_main_question_field and question_index < len(all_questions):
+                    current = all_questions[question_index]
+                    question_text = clean_question_text(current["question"])
+
+                    field = driver.find_element(By.ID, input_id)
+
+                    # Only checkbox instruction questions like 7b, 8b, 10b need the
+                    # Question identifier field filled. For normal questions, do not touch it.
+                    if is_checkbox_instruction_question(question_text):
+                        fill_question_identifier(driver, current.get("number"))
+                        set_text_input_value(
+                            driver,
+                            field,
+                            question_text,
+                            label=f"checkbox question text {current.get('number')}"
+                        )
+                        print(
+                            f"☑️ Checkbox instruction detected for question {current['number']}. "
+                            "Filled translated question text and identifier."
+                        )
+                    else:
+                        set_text_input_value(
+                            driver,
+                            field,
+                            question_text,
+                            label="question text"
+                        )
+                        print(f"❓ Set question: {question_text}")
+
+                    if current.get("statements"):
+                        print("📐 Matrix question detected.")
+                        fill_matrix_question(driver, current)
+                    else:
+                        print("🅰️ Standard question detected. Filling answers...")
+
+                        answers = [
+                            a.strip()
+                            for a in current.get("answers", [])
+                            if not is_instruction_text(a.strip())
+                        ]
+
+                        print("Answers extracted:")
+                        for idx, ans in enumerate(answers):
+                            print(f"  {idx}: {ans}")
+
+                        answer_fields = driver.find_elements(
+                            By.CSS_SELECTOR,
+                            'input[id^="edit-field-potential-answers-"][id$="-value"]'
+                        )
+
+                        available_count = len(answer_fields)
+
+                        if len(answers) > available_count:
+                            print(
+                                f"⚠️ Word contains {len(answers)} answers "
+                                f"but form only contains {available_count} fields."
+                            )
+                            print("⚠️ Missing answers:")
+                            for missing in answers[available_count:]:
+                                print(f"   - {missing}")
+                            raise RuntimeError("Not enough answer fields; cannot save incomplete translation")
+
+                        for i, ans in enumerate(answers[:available_count]):
+                            try:
+                                ans_field = WebDriverWait(driver, 10).until(
+                                    EC.presence_of_element_located(
+                                        (
+                                            By.ID,
+                                            f"edit-field-potential-answers-{i}-value"
+                                        )
+                                    )
+                                )
+
+                                driver.execute_script(
+                                    "arguments[0].scrollIntoView({block:'center'});",
+                                    ans_field
+                                )
+
+                                if not set_text_input_value(
+                                    driver,
+                                    ans_field,
+                                    ans,
+                                    label=f"answer {i + 1}"
+                                ):
+                                    raise RuntimeError(f"Failed to set answer {i + 1}")
+
+                                print(f"✅ Answer {i + 1}: {ans}")
+
+                            except Exception as e:
+                                raise RuntimeError(f"Could not set answer {i + 1}: {ans}") from e
+
+                    if current.get("help_text"):
+                        fill_ckeditor5_field(
+                            driver,
+                            "edit-help-0-value",
+                            current["help_text"],
+                            label="Help text"
+                        )
+                    else:
+                        fill_ckeditor5_field(
+                            driver,
+                            "edit-help-0-value",
+                            "",
+                            label="Help text cleared"
+                        )
+
+                    if current.get("redirect"):
+                        fill_ckeditor5_field(
+                            driver,
+                            "edit-conditional-help-0-value",
+                            current["redirect"],
+                            label="Redirect"
+                        )
+                    else:
+                        fill_ckeditor5_field(
+                            driver,
+                            "edit-conditional-help-0-value",
+                            "",
+                            label="Redirect cleared"
+                        )
+
+                    question_index += 1
+                    item_filled = True
+                    break
+
+            if not item_filled:
+                raise RuntimeError(f"No matching category/question field for item {item_index + 1}; not saving")
+
+            save_button = WebDriverWait(driver, 20).until(
+                EC.element_to_be_clickable((By.ID, "edit-submit"))
+            )
+
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});",
+                save_button
+            )
+
+            time.sleep(1)
+            # Czech script uses JavaScript click; use the same submission method.
+            driver.execute_script("arguments[0].click();", save_button)
+
+            print("💾 Clicked Save")
+            time.sleep(3)
+            page_text = driver.find_element(By.TAG_NAME, "body").text
+            if "The website encountered an unexpected error" in page_text:
+                driver.save_screenshot("apitest_category_error.png")
+                raise RuntimeError("APITEST server error after Save. Screenshot: apitest_category_error.png")
+            if driver.find_elements(By.CSS_SELECTOR, ".messages--error, .alert-danger, [role='alert']"):
+                driver.save_screenshot("apitest_form_error.png")
+                raise RuntimeError("APITEST reported a form error. Screenshot: apitest_form_error.png")
+            print("✅ Saved item", item_index + 1, "of", total_items)
+            print("Post-save URL:", driver.current_url)
+            item_index += 1
+            time.sleep(2)
+            driver.get(questionnaire_url)
+
+        except Exception as e:
+            print(f"❌ Error at item {item_index + 1}: {e}")
+            print("🛑 Stopping to avoid shifting subsequent translations after an error.")
+
+            try:
+                driver.save_screenshot("apitest_translation_failure.png")
+            except Exception:
+                pass
+
+            raise RuntimeError(f"Translation stopped at item {item_index + 1}") from e
+
+
+# =============================================================
+# ------------------ Run Script -------------------------------
+# =============================================================
+
+if __name__ == "__main__":
+    categories = extract_data(file_path)
+    if not categories or not any(cat["questions"] for cat in categories):
+        raise RuntimeError("No categories/questions extracted from Meat Word file")
+
+    print("✅ Ready to process translations.")
+    print("Total categories loaded:", len(categories))
+    print("First category:", categories[0]["category_name"] if categories else "NONE")
+    print("Total questions loaded:", sum(len(cat["questions"]) for cat in categories))
+
+    for cat in categories:
+        for q in cat["questions"]:
+            if q["number"] in ["7a", "7b", "8a", "8b", "10a", "10b", "92a", "92b"]:
+                print("\n--------------------------------")
+                print("Question:", q["number"])
+                print("Text:", q["question"])
+                print("Answers:", q["answers"])
+                print("--------------------------------")
+
+    print("⚠️ Verify the APITEST Meat questionnaire slug before running. Configured:", questionnaire_url)
+    driver = webdriver.Chrome()
+    inloggen()
+    driver.get(questionnaire_url)
+    process_items(driver, categories)
+    print("🎉 Completed the full Dutch translation processing on APITEST.")
